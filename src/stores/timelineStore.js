@@ -17,6 +17,7 @@ import { buildRollEditPreviewFeedback } from '../utils/rollEditPreview.mjs'
 import { createSlipEditSession, planSlipEdit, buildSlipEditPreviewFeedback } from '../utils/slipEdit.mjs'
 import { createSlideEditSession, planSlideEdit, buildSlideEditPreviewFeedback } from '../utils/slideEdit.mjs'
 import { createRippleTrimSession, planRippleTrim, buildRippleTrimPreviewFeedback } from '../utils/rippleTrim.mjs'
+import { planCloseTimelineGap } from '../utils/closeTimelineGap.mjs'
 import { persist } from 'zustand/middleware'
 import { TRANSITION_DEFAULT_SETTINGS, FRAME_RATE } from '../constants/transitions'
 import { buildTextAnimationPresetKeyframes, TEXT_ANIMATION_KEYFRAME_PROPERTIES } from '../utils/textAnimationPresets'
@@ -2940,68 +2941,28 @@ export const useTimelineStore = create(
     return get().rippleDeleteClipIds(state.selectedClipIds)
   },
 
+  previewSelectedGapDelete: () => {
+    const state = get()
+    const { clips, transitions, ...preview } = planCloseTimelineGap({ clips: state.clips, tracks: state.tracks,
+      transitions: state.transitions, gap: state.selectedGap, fps: state.timelineFps })
+    return { ...preview, changed: false }
+  },
+
   rippleDeleteSelectedGap: () => {
     const state = get()
-    const selectedGap = state.selectedGap
-    if (!selectedGap?.trackId || !Number.isFinite(selectedGap?.startTime) || !Number.isFinite(selectedGap?.endTime)) {
-      return false
-    }
-
-    const gapRange = mergeTimeRanges([{
-      start: Math.max(0, selectedGap.startTime),
-      end: Math.max(0, selectedGap.endTime),
-    }])
-    if (gapRange.length === 0) {
-      set({ selectedGap: null })
-      return false
-    }
-
-    const fps = state.timelineFps || 24
-    get().saveToHistory()
-
-    set((currentState) => {
-      const linkGroupShiftAmounts = new Map()
-
-      currentState.clips.forEach((clip) => {
-        if (clip.trackId !== selectedGap.trackId) return
-
-        const shiftAmount = getRippleShiftAmount(clip.startTime, gapRange)
-        if (shiftAmount <= RIPPLE_TIME_EPSILON) return
-
-        const linkGroupId = getNormalizedLinkGroupId(clip.linkGroupId)
-        if (!linkGroupId) return
-
-        const existingShiftAmount = linkGroupShiftAmounts.get(linkGroupId) || 0
-        linkGroupShiftAmounts.set(linkGroupId, Math.max(existingShiftAmount, shiftAmount))
-      })
-
-      const shiftedClips = currentState.clips.map((clip) => {
-        const directTrackShift = clip.trackId === selectedGap.trackId
-          ? getRippleShiftAmount(clip.startTime, gapRange)
-          : 0
-        const linkedShift = linkGroupShiftAmounts.get(getNormalizedLinkGroupId(clip.linkGroupId)) || 0
-        const shiftAmount = Math.max(directTrackShift, linkedShift)
-
-        if (shiftAmount <= RIPPLE_TIME_EPSILON) return clip
-
-        return {
-          ...clip,
-          startTime: roundToFrame(Math.max(0, clip.startTime - shiftAmount), fps),
-        }
-      })
-
-      const cleanedState = cleanupBrokenBetweenTransitions(shiftedClips, currentState.transitions)
-
-      return {
-        clips: cleanedState.clips,
-        transitions: cleanedState.transitions,
-        selectedClipIds: [],
-        selectedTransitionId: null,
-        selectedMarkerId: null,
-        selectedGap: null,
-      }
-    })
-
+    // Re-plan from current state; a preview must never authorize stale edits.
+    const plan = planCloseTimelineGap({ clips: state.clips, tracks: state.tracks,
+      transitions: state.transitions, gap: state.selectedGap, fps: state.timelineFps })
+    if (!plan.ok) return false
+    let snapshot
+    try { snapshot = createHistorySnapshot(state) } catch (_) { return false }
+    let history = state.historyIndex >= 0 ? state.history.slice(0, state.historyIndex + 1) : [...state.history]
+    if (!history.length || !areHistorySnapshotsEqual(history[history.length - 1], snapshot)) history.push(snapshot)
+    // Publish the checkpoint and every track together so subscribers never see
+    // an intermediate edit with picture and independently recorded audio apart.
+    set({ clips: plan.clips, transitions: plan.transitions, selectedClipIds: [], selectedTransitionId: null,
+      selectedMarkerId: null, selectedGap: null, history: history.slice(-MAX_HISTORY_SIZE),
+      historyIndex: -1, historyLastChangedAt: Date.now() })
     return true
   },
 

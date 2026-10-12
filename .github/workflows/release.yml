@@ -51,6 +51,11 @@ jobs:
           npm run test:media-preparation
           npm run check:media-preparation
 
+      - name: Verify timeline hotfixes and native audio analysis
+        run: |
+          npm run test:timeline-hotfixes
+          npm run test:audio-analysis
+
       - name: Verify RIFE source and package hardening
         run: npm run test:rife-hardening
 

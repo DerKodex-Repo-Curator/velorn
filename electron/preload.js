@@ -411,6 +411,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
    */
   getAudioWaveform: (mediaInput, options = {}) => ipcRenderer.invoke('media:getAudioWaveform', mediaInput, options),
 
+  /** Analyze a bounded local audio range outside the renderer; returns a summary only. */
+  analyzeAudio: (request) => ipcRenderer.invoke('media:analyzeAudio', request),
+
   /**
    * Trim a short audio segment with FFmpeg and return a temporary WAV path.
    * @param {object} options - { inputPath, startSeconds, durationSeconds, outputName?, timeoutMs? }
