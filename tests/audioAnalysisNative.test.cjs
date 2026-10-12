@@ -19,7 +19,10 @@ const source = { absolutePath: path.resolve('synthetic.wav') }
 
 test('source resolution accepts local POSIX/Windows paths and encoded portable media URLs', () => {
   assert.equal(resolveAudioAnalysisSource({ path: 'media/a b.wav', projectPath: '/project' }, { platform: 'linux' }), '/project/media/a b.wav')
-  assert.equal(resolveAudioAnalysisSource({ url: 'file:///project/a%20b.wav' }, { platform: 'linux' }), '/project/a b.wav')
+  // Node's fileURLToPath uses the host OS even when the path resolver's test
+  // platform is injected. Exercise this URL branch using a real host path.
+  const hostFilePath = path.resolve('project', 'a b.wav')
+  assert.equal(resolveAudioAnalysisSource({ url: pathToFileURL(hostFilePath).href }), hostFilePath)
   assert.equal(resolveAudioAnalysisSource({ url: 'comfystudio://%2Fproject%2Fa%20b.wav' }, { platform: 'linux' }), '/project/a b.wav')
   assert.equal(resolveAudioAnalysisSource({ absolutePath: 'C:\\Media\\A.wav' }, { platform: 'win32' }), 'C:\\Media\\A.wav')
   assert.equal(resolveAudioAnalysisSource({ url: 'file:///C:/Media/A%20B.wav' }, { platform: 'win32' }), 'C:\\Media\\A B.wav')
