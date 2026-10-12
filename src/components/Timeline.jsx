@@ -27,6 +27,7 @@ import AudioVolumeEnvelope, { getSingleAudioEnvelopeTarget, resetAudioVolumeEnve
 import { buildTrimPreviewFeedback } from '../utils/trimPreview.mjs'
 import { resolveTimelineSelectionViewport } from '../utils/timelineSelectionViewport.mjs'
 import { createTimelineScrubScheduler, resolveTimelineScrubSample } from '../utils/timelineScrubScheduler.mjs'
+import { canSplitActiveTrackAtPlayhead, getActiveTrackSplitTarget } from '../utils/timelineSplitTarget.mjs'
 import { findTransitionCutTarget, isTransitionCutTargetCurrent, isTransitionDrag, parseTransitionDrag } from '../utils/transitionCutTarget.mjs'
 import { isFrameStepSeekIntentAtTime } from '../utils/previewVideoSeeking'
 import { useSnapping, SNAP_TYPES } from '../hooks/useSnapping'
@@ -63,6 +64,7 @@ import {
 import MasterAudioMeter from './AudioMeter'
 import GenerateMusicPopover from './GenerateMusicPopover'
 import { analyzeAudioSource } from '../services/audioAnalysis'
+import { captureBeatMarkerRequest, isBeatMarkerRequestCurrent, buildDetectedBeatMarkers } from '../utils/beatMarkers.mjs'
 import { getClipPlaybackTimeAtTimeline } from '../utils/clipPlaybackTiming'
 import { canRevealAssetInFileManager, getRevealInFileManagerLabel, revealAssetInFileManager } from '../utils/revealInFileManager'
 import { useI18n } from '../i18n/I18nContext'
@@ -569,6 +571,19 @@ const pickTimelineStoreSlice = (state) => {
   return slice
 }
 
+// Keep playhead-driven enablement local to the button. The clip area remains
+// unsubscribed from playback ticks, while crossing a cut/gap updates Split.
+const ActiveTrackSplitButton = memo(function ActiveTrackSplitButton({ onClick, className, showLabel, availableTitle, unavailableTitle }) {
+  const canSplit = useTimelineStore(canSplitActiveTrackAtPlayhead)
+  return (
+    <button onClick={onClick} disabled={!canSplit} className={className}
+      title={canSplit ? availableTitle : unavailableTitle}>
+      <Scissors className="w-3 h-3" />
+      {showLabel && 'Split'}
+    </button>
+  )
+})
+
 // Ruler ticks live in their own memoized component: at frame-level zoom a
 // long timeline emits thousands of tick elements, and re-reconciling them on
 // every playhead tick during playback dwarfs the rest of the ruler. Props
@@ -847,50 +862,47 @@ function Timeline({ onActiveToolChange, onStatusChange }) {
   const [musicPopoverAnchor, setMusicPopoverAnchor] = useState(null)
   const [beatAnalysisClipId, setBeatAnalysisClipId] = useState(null)
   const [beatAnalysisError, setBeatAnalysisError] = useState('')
+  const beatAnalysisRequestRef = useRef(null)
+  useEffect(() => () => { beatAnalysisRequestRef.current = null }, [])
 
   // "Detect Beats → Markers": run the audio-analysis engine on the clip's
   // trimmed source range and drop a marker on every beat, in one undo step.
   // The context menu stays open while analyzing (and on error) so the user
   // sees the status; it closes itself on success.
   const handleDetectBeatsForClip = useCallback(async (clipId) => {
+    if (beatAnalysisRequestRef.current) return
     const state = useTimelineStore.getState()
+    const project = useProjectStore.getState()
     const clip = (state.clips || []).find((candidate) => candidate.id === clipId)
     const asset = clip?.assetId ? useAssetsStore.getState().getAssetById(clip.assetId) : null
     if (!clip || !asset) return
 
+    const requestToken = {}
+    beatAnalysisRequestRef.current = requestToken
     setBeatAnalysisError('')
     setBeatAnalysisClipId(clipId)
     try {
-      if (clip.reverse) throw new Error('Beat markers are not supported on reversed clips.')
-      if ((clip.keyframes?.speed?.length || 0) > 0) throw new Error('Beat markers are not supported on speed-ramped clips yet.')
-
-      const baseScale = clip.sourceTimeScale || (clip.timelineFps && clip.sourceFps ? clip.timelineFps / clip.sourceFps : 1)
-      const speed = Number(clip.speed) > 0 ? Number(clip.speed) : 1
-      const timeScale = baseScale * speed
-      const trimStart = Number(clip.trimStart) || 0
-      const trimEnd = Number.isFinite(Number(clip.trimEnd))
-        ? Number(clip.trimEnd)
-        : trimStart + (Number(clip.duration) || 0) * timeScale
-
+      const request = captureBeatMarkerRequest(state, project, clip, asset)
       const analysis = await analyzeAudioSource(
-        { url: asset.url || '', absolutePath: asset.absolutePath || asset.path || '' },
-        { startSeconds: trimStart, endSeconds: trimEnd, includeLoudnessCurve: false }
+        { url: asset.url || '', absolutePath: asset.absolutePath || '', path: asset.path || '',
+          projectPath: typeof project.currentProjectHandle === 'string' ? project.currentProjectHandle : '' },
+        { startSeconds: request.startSeconds, endSeconds: request.endSeconds, includeLoudnessCurve: false }
       )
-      if (analysis?.error) throw new Error(analysis.error)
-      if (!analysis?.beats?.length) throw new Error('No steady beat detected in this clip.')
-
-      const clipStart = Number(clip.startTime) || 0
-      const markers = analysis.beats.slice(0, 600).map((beat, index) => ({
-        time: clipStart + beat / timeScale,
-        label: index === 0 ? `Beats ${analysis.bpm ? `${analysis.bpm} BPM` : ''}`.trim() : '',
-        color: '#38bdf8',
-      }))
-      useTimelineStore.getState().addMarkersBatch(markers)
+      if (beatAnalysisRequestRef.current !== requestToken) return
+      const currentState = useTimelineStore.getState()
+      if (!isBeatMarkerRequestCurrent(request, currentState, useProjectStore.getState(),
+        useAssetsStore.getState().getAssetById(request.assetId))) {
+        throw new Error('The clip or timeline changed during analysis. No markers were added; detect beats again.')
+      }
+      currentState.addMarkersBatch(buildDetectedBeatMarkers(request, analysis))
       setClipContextMenu(null)
     } catch (err) {
-      setBeatAnalysisError(err?.message || 'Beat detection failed.')
+      if (beatAnalysisRequestRef.current === requestToken) setBeatAnalysisError(err?.message || 'Beat detection failed.')
     } finally {
-      setBeatAnalysisClipId(null)
+      if (beatAnalysisRequestRef.current === requestToken) {
+        beatAnalysisRequestRef.current = null
+        setBeatAnalysisClipId(null)
+      }
     }
   }, [])
   const [moveOffsetDialogOpen, setMoveOffsetDialogOpen] = useState(false)
@@ -1416,23 +1428,17 @@ function Timeline({ onActiveToolChange, onStatusChange }) {
   )
   const hasCompoundSelection = selectedClips.some(clip => clip.type === 'compound')
   const contextCompoundClip = clips.find(clip => clip.id === clipContextMenu?.clipId && clip.type === 'compound')
-  const activeTrackClipAtPlayhead = useMemo(() => {
-    if (!activeTrackId) return null
-    const playheadPosition = getLivePlayhead()
-    return clips.find(
-      (clip) => clip.trackId === activeTrackId
-        && playheadPosition > clip.startTime
-        && playheadPosition < clip.startTime + clip.duration
-    ) || null
-    // getLivePlayhead is intentionally unreactive: this value feeds toolbar
-    // enablement, which any interaction re-render refreshes soon enough.
-  }, [activeTrackId, clips])
   const canDeleteCurrentSelection = selectedClipIds.length > 0
     || Boolean(selectedGap)
     || Boolean(selectedTransitionId)
     || Boolean(selectedMarkerId)
+  const [gapDeleteError, setGapDeleteError] = useState('')
+  useEffect(() => {
+    setGapDeleteError('')
+  }, [selectedGap, clips, tracks])
 
   const handleDeleteCurrentSelection = useCallback(() => {
+    setGapDeleteError('')
     if (selectedClipIds.length > 0) {
       if (rippleEditMode) {
         rippleDeleteSelectedClips()
@@ -1442,7 +1448,13 @@ function Timeline({ onActiveToolChange, onStatusChange }) {
       return true
     }
     if (selectedGap) {
-      rippleDeleteSelectedGap()
+      const preview = useTimelineStore.getState().previewSelectedGapDelete()
+      if (!preview.ok) {
+        setGapDeleteError(preview.reason || 'This gap cannot be closed safely. No clips were moved.')
+      } else if (!rippleDeleteSelectedGap()) {
+        setGapDeleteError(useTimelineStore.getState().previewSelectedGapDelete().reason
+          || 'This gap could not be closed safely. No clips were moved.')
+      }
       return true
     }
     if (selectedTransitionId) {
@@ -3279,9 +3291,12 @@ function Timeline({ onActiveToolChange, onStatusChange }) {
     return true
   }, [splitClipAtTime])
 
-  const handleSplitActiveTrackAtPlayhead = useCallback(() => (
-    handleSplitClipAtPlayhead(activeTrackClipAtPlayhead)
-  ), [activeTrackClipAtPlayhead, handleSplitClipAtPlayhead])
+  const handleSplitActiveTrackAtPlayhead = useCallback(() => {
+    const state = useTimelineStore.getState()
+    const clip = getActiveTrackSplitTarget(state)
+    if (!clip) return false
+    return Boolean(splitClipAtTime(clip, state.playheadPosition, { saveHistory: true }))
+  }, [splitClipAtTime])
 
   const ensureTimelineTimeVisible = useCallback((time) => {
     if (!timelineRef.current || !Number.isFinite(Number(time))) return
@@ -3658,10 +3673,9 @@ function Timeline({ onActiveToolChange, onStatusChange }) {
         return
       }
 
-      if (matchEditorHotkey(e, editorHotkeys[EDITOR_HOTKEY_IDS.SPLIT_ACTIVE]) && activeTrackId) {
-        if (activeTrackClipAtPlayhead) {
+      if (matchEditorHotkey(e, editorHotkeys[EDITOR_HOTKEY_IDS.SPLIT_ACTIVE])) {
+        if (handleSplitActiveTrackAtPlayhead()) {
           e.preventDefault()
-          handleSplitActiveTrackAtPlayhead()
         }
       }
     }
@@ -3670,7 +3684,7 @@ function Timeline({ onActiveToolChange, onStatusChange }) {
     return () => {
       window.removeEventListener('keydown', handleKeyDown)
     }
-  }, [toggleSnapping, toggleRippleEdit, addMarker, selectedClipIds, selectedGap, selectedTransitionId, selectedMarkerId, removeSelectedClips, rippleDeleteSelectedClips, rippleDeleteSelectedGap, removeTransition, removeMarker, clearSelection, selectMarker, clips, handleUndoAction, handleRedoAction, activeTrackId, saveToHistory, resizeClip, addClip, addTextClip, addShapeClip, addTextClipAtPlayhead, addShapeClipAtPlayhead, addAdjustmentClip, updateClipTrim, assets, timelineFps, copySelectedClips, pasteClipsAtPlayhead, copiedClips, selectClipsFromPlayheadToEnd, selectClipsFromTimelineStartToPlayhead, splitClipAtTime, splitAllTracksAtPlayhead, openMoveOffsetDialog, openDurationDeltaDialog, moveOffsetDialogOpen, durationDeltaDialogOpen, editorHotkeys, linkSelectedClips, unlinkSelectedClips, lockSyncClips, unlockSyncLockedClips, toggleClipSelectionEnabled, applyZoomWithPlayheadPivot, handleFrameAll, handleZoomToSelection, zoom, rippleEditMode, activeTrackClipAtPlayhead, canDeleteCurrentSelection, handleCopySelection, handleDeleteCurrentSelection, handlePasteAtPlayhead, handleSplitActiveTrackAtPlayhead, jumpPlayheadToClipBoundary, jumpPlayheadToMarker, clipContextSyncEligibleClips, clipContextSyncLockByClipId, clipContextAllSyncLocked])
+  }, [toggleSnapping, toggleRippleEdit, addMarker, selectedClipIds, selectedGap, selectedTransitionId, selectedMarkerId, removeSelectedClips, rippleDeleteSelectedClips, rippleDeleteSelectedGap, removeTransition, removeMarker, clearSelection, selectMarker, clips, handleUndoAction, handleRedoAction, activeTrackId, saveToHistory, resizeClip, addClip, addTextClip, addShapeClip, addTextClipAtPlayhead, addShapeClipAtPlayhead, addAdjustmentClip, updateClipTrim, assets, timelineFps, copySelectedClips, pasteClipsAtPlayhead, copiedClips, selectClipsFromPlayheadToEnd, selectClipsFromTimelineStartToPlayhead, splitClipAtTime, splitAllTracksAtPlayhead, openMoveOffsetDialog, openDurationDeltaDialog, moveOffsetDialogOpen, durationDeltaDialogOpen, editorHotkeys, linkSelectedClips, unlinkSelectedClips, lockSyncClips, unlockSyncLockedClips, toggleClipSelectionEnabled, applyZoomWithPlayheadPivot, handleFrameAll, handleZoomToSelection, zoom, rippleEditMode, canDeleteCurrentSelection, handleCopySelection, handleDeleteCurrentSelection, handlePasteAtPlayhead, handleSplitActiveTrackAtPlayhead, jumpPlayheadToClipBoundary, jumpPlayheadToMarker, clipContextSyncEligibleClips, clipContextSyncLockByClipId, clipContextAllSyncLocked])
 
   // Spacebar panning key state (dedicated listeners so keyup cannot get "stuck")
   useEffect(() => {
@@ -6184,6 +6198,10 @@ function Timeline({ onActiveToolChange, onStatusChange }) {
         <span className="text-[10px] text-sf-text-muted">Original clips · one level only</span>
       </div>}
       {compoundNavigationError && <p data-testid="compound-navigation-status" role="alert" className="flex-shrink-0 break-words border-b border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-200">{compoundNavigationError}</p>}
+      {gapDeleteError && <div data-testid="gap-delete-status" role="alert" className="flex flex-shrink-0 items-start gap-2 border-b border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-200">
+        <p className="min-w-0 flex-1 break-words">{gapDeleteError}</p>
+        <button type="button" onClick={() => setGapDeleteError('')} aria-label="Dismiss gap message" className="rounded p-0.5 hover:bg-amber-500/15"><X className="h-3 w-3" /></button>
+      </div>}
       {isMusicPopoverOpen && (
         <GenerateMusicPopover
           anchorRect={musicPopoverAnchor}
@@ -6287,17 +6305,13 @@ function Timeline({ onActiveToolChange, onStatusChange }) {
               <Scissors className="w-3 h-3" />
               {showToolbarLabels && 'Cut All'}
             </button>
-            <button
+            <ActiveTrackSplitButton
               onClick={handleSplitActiveTrackAtPlayhead}
-              disabled={!activeTrackClipAtPlayhead || activeTrackClipAtPlayhead.type === 'compound'}
               className={toolbarButtonClass}
-              title={activeTrackClipAtPlayhead
-                ? t('timelineEditor.tooltips.splitActive', { shortcut: splitActiveHotkeyLabel })
-                : t('timelineEditor.tooltips.splitActiveUnavailable', { shortcut: splitActiveHotkeyLabel })}
-            >
-              <Scissors className="w-3 h-3" />
-              {showToolbarLabels && 'Split'}
-            </button>
+              showLabel={showToolbarLabels}
+              availableTitle={t('timelineEditor.tooltips.splitActive', { shortcut: splitActiveHotkeyLabel })}
+              unavailableTitle={t('timelineEditor.tooltips.splitActiveUnavailable', { shortcut: splitActiveHotkeyLabel })}
+            />
             <button
               onClick={handleCopySelection}
               disabled={selectedClipIds.length === 0 || hasCompoundSelection}
@@ -6348,7 +6362,7 @@ function Timeline({ onActiveToolChange, onStatusChange }) {
                 selectedClipIds.length > 0
                   ? t(rippleEditMode ? 'timelineEditor.tooltips.rippleDeleteSelected' : 'timelineEditor.tooltips.deleteSelected')
                   : selectedGap
-                    ? t('timelineEditor.tooltips.deleteGap')
+                    ? 'Close this empty gap across all tracks. Stops if any media occupies the same time or affected clips are locked.'
                     : selectedTransitionId
                       ? t('timelineEditor.tooltips.deleteTransition')
                       : selectedMarkerId
@@ -8615,7 +8629,7 @@ function Timeline({ onActiveToolChange, onStatusChange }) {
               <>
                 <button
                   onClick={() => handleDetectBeatsForClip(contextClip.id)}
-                  disabled={isAnalyzing}
+                  disabled={Boolean(beatAnalysisClipId)}
                   className="w-full px-3 py-1.5 text-left text-xs text-sf-text-primary hover:bg-sf-dark-700 flex items-center gap-2 transition-colors disabled:opacity-50 disabled:cursor-default"
                 >
                   {isAnalyzing
@@ -8624,7 +8638,7 @@ function Timeline({ onActiveToolChange, onStatusChange }) {
                   <span>{isAnalyzing ? 'Detecting beats…' : 'Detect Beats → Markers'}</span>
                 </button>
                 {beatAnalysisError && (
-                  <div className="px-3 pb-1 text-[10px] text-sf-error">{beatAnalysisError}</div>
+                  <div role="alert" data-testid="beat-analysis-error" className="px-3 pb-1 text-[10px] text-sf-error">{beatAnalysisError}</div>
                 )}
                 <div className="h-px bg-sf-dark-600 my-1" />
               </>

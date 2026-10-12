@@ -28,6 +28,7 @@ const {
   probeStreamHasAlpha,
 } = require('./mediaAlpha')
 const { registerCaptionWhisperHandlers } = require('./captionWhisper')
+const { registerAudioAnalysisHandlers } = require('./audioAnalysisNative.cjs')
 const {
   cancelRtxVideoUpscale,
   checkRtxRuntime,
@@ -4324,6 +4325,8 @@ ipcMain.handle('media:getVideoFps', async (event, filePath) => {
 })
 
 const audioWaveformCache = new Map()
+
+registerAudioAnalysisHandlers({ ipcMain, app, ffmpegPath, ffprobePath })
 
 function resolveMediaInputPath(mediaInput) {
   if (!mediaInput || typeof mediaInput !== 'string') return null

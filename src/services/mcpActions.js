@@ -2596,8 +2596,14 @@ async function handleGetAudioAnalysis(payload = {}) {
     throw new Error(`Asset "${asset.name}" is a ${asset.type || 'non-media'} asset — audio analysis needs an audio or video source.`)
   }
 
+  const projectHandle = useProjectStore.getState().currentProjectHandle
   const analysis = await analyzeAudioSource(
-    { url: asset.url || '', absolutePath: asset.absolutePath || asset.path || '' },
+    {
+      url: asset.url || '',
+      absolutePath: asset.absolutePath || '',
+      path: asset.path || '',
+      projectPath: typeof projectHandle === 'string' ? projectHandle : '',
+    },
     {
       ...range,
       silenceThresholdDb: payload.silenceThresholdDb,
